@@ -17,6 +17,7 @@
 //! - [`types`] — all shared x402 protocol structures and payload formats.
 
 pub mod chain;
+pub mod config;
 pub mod facilitator;
 pub mod facilitator_local;
 pub mod from_env;

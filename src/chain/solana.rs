@@ -1,11 +1,12 @@
 use crate::chain::{FacilitatorLocalError, FromEnvByNetworkBuild, NetworkProviderOps};
+use crate::config::UniversalSettleConfig;
 use crate::facilitator::Facilitator;
 use crate::from_env;
 use crate::network::Network;
 use crate::types::{
-    Base64Bytes, ExactPaymentPayload, FacilitatorErrorReason, MixedAddress, PaymentRequirements,
-    SettleRequest, SettleResponse, SupportedPaymentKind, SupportedPaymentKindExtra,
-    SupportedPaymentKindsResponse, TokenAmount, TransactionHash, VerifyRequest, VerifyResponse,
+    Base64Bytes, ExactPaymentPayload, MixedAddress, PaymentRequirements, SettleRequest,
+    SettleResponse, SupportedPaymentKind, SupportedPaymentKindExtra, SupportedPaymentKindsResponse,
+    TokenAmount, TransactionHash, VerifyRequest, VerifyResponse,
 };
 use crate::types::{Scheme, X402Version};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -16,11 +17,13 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::VersionedTransaction;
+use spl_associated_token_account::get_associated_token_address;
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing_core::Level;
+use universalsettle_api::consts::CONFIG;
+use universalsettle_api::state::Config as UniversalSettleConfigState;
 
 #[derive(Clone, Debug)]
 pub struct SolanaChain {
@@ -69,12 +72,12 @@ impl TryFrom<MixedAddress> for SolanaAddress {
 
     fn try_from(value: MixedAddress) -> Result<Self, Self::Error> {
         match value {
-            MixedAddress::Evm(_) => Err(FacilitatorLocalError::InvalidAddress(
-                "expected Solana address".to_string(),
-            )),
-            MixedAddress::Offchain(_) => Err(FacilitatorLocalError::InvalidAddress(
-                "expected Solana address".to_string(),
-            )),
+            MixedAddress::Evm(_) => {
+                Err(FacilitatorLocalError::InvalidAddress("expected Solana address".to_string()))
+            },
+            MixedAddress::Offchain(_) => {
+                Err(FacilitatorLocalError::InvalidAddress("expected Solana address".to_string()))
+            },
             MixedAddress::Solana(pubkey) => Ok(Self { pubkey }),
         }
     }
@@ -91,6 +94,7 @@ pub struct SolanaProvider {
     keypair: Arc<Keypair>,
     chain: SolanaChain,
     rpc_client: Arc<RpcClient>,
+    config: UniversalSettleConfig,
 }
 
 impl Debug for SolanaProvider {
@@ -108,6 +112,7 @@ impl SolanaProvider {
         keypair: Keypair,
         rpc_url: String,
         network: Network,
+        config: UniversalSettleConfig,
     ) -> Result<Self, FacilitatorLocalError> {
         let chain = SolanaChain::try_from(network)?;
         {
@@ -115,11 +120,32 @@ impl SolanaProvider {
             tracing::info!(network=%network, rpc=rpc_url, signers=?signer_addresses, "Initialized provider");
         }
         let rpc_client = RpcClient::new(rpc_url);
-        Ok(Self {
-            keypair: Arc::new(keypair),
-            chain,
-            rpc_client: Arc::new(rpc_client),
-        })
+        Ok(Self { keypair: Arc::new(keypair), chain, rpc_client: Arc::new(rpc_client), config })
+    }
+
+    /// Read the Config account from the chain
+    async fn read_config(&self) -> Result<UniversalSettleConfigState, FacilitatorLocalError> {
+        let (config_pda, _) =
+            Pubkey::find_program_address(&[CONFIG], &self.config.universalsettle_program_id);
+
+        let account = self.rpc_client.get_account(&config_pda).await.map_err(|e| {
+            FacilitatorLocalError::ContractCall(format!("Failed to get config account: {}", e))
+        })?;
+
+        // Deserialize the account data (skip 8-byte discriminator)
+        if account.data.len() < std::mem::size_of::<UniversalSettleConfigState>() + 8 {
+            return Err(FacilitatorLocalError::DecodingError(
+                "Config account data too short".to_string(),
+            ));
+        }
+
+        // Deserialize using bytemuck
+        let config = bytemuck::try_from_bytes::<UniversalSettleConfigState>(&account.data[8..])
+            .map_err(|e| {
+                FacilitatorLocalError::DecodingError(format!("Failed to deserialize config: {}", e))
+            })?;
+
+        Ok(*config)
     }
 
     pub fn verify_compute_limit_instruction(
@@ -129,11 +155,9 @@ impl SolanaProvider {
     ) -> Result<(), FacilitatorLocalError> {
         let instructions = transaction.message.instructions();
         let instruction =
-            instructions
-                .get(instruction_index)
-                .ok_or(FacilitatorLocalError::DecodingError(
-                    "invalid_exact_svm_payload_transaction_instructions_length".to_string(),
-                ))?;
+            instructions.get(instruction_index).ok_or(FacilitatorLocalError::DecodingError(
+                "invalid_exact_svm_payload_transaction_instructions_length".to_string(),
+            ))?;
         let account = instruction.program_id(transaction.message.static_account_keys());
         let compute_budget = solana_sdk::compute_budget::ID;
         if compute_budget.ne(account) || instruction.data.first().cloned().unwrap_or(0) != 2 {
@@ -152,12 +176,10 @@ impl SolanaProvider {
     ) -> Result<(), FacilitatorLocalError> {
         let instructions = transaction.message.instructions();
         let instruction =
-            instructions
-                .get(instruction_index)
-                .ok_or(FacilitatorLocalError::DecodingError(
-                    "invalid_exact_svm_payload_transaction_instructions_compute_price_instruction"
-                        .to_string(),
-                ))?;
+            instructions.get(instruction_index).ok_or(FacilitatorLocalError::DecodingError(
+                "invalid_exact_svm_payload_transaction_instructions_compute_price_instruction"
+                    .to_string(),
+            ))?;
         let account = instruction.program_id(transaction.message.static_account_keys());
         let compute_budget = solana_sdk::compute_budget::ID;
         let data = instruction.data.as_slice();
@@ -244,12 +266,12 @@ impl SolanaProvider {
             let (amount, decimals) = match token_instruction {
                 spl_token::instruction::TokenInstruction::TransferChecked { amount, decimals } => {
                     (amount, decimals)
-                }
+                },
                 _ => {
                     return Err(FacilitatorLocalError::DecodingError(
                         "invalid_exact_svm_payload_transaction_instructions".to_string(),
                     ));
-                }
+                },
             };
             // Source = 0
             let source = instruction.account(0)?;
@@ -286,7 +308,7 @@ impl SolanaProvider {
                     return Err(FacilitatorLocalError::DecodingError(
                         "invalid_exact_svm_payload_transaction_instructions".to_string(),
                     ));
-                }
+                },
             };
             // Source = 0
             let source = instruction.account(0)?;
@@ -368,7 +390,7 @@ impl SolanaProvider {
         let payment_payload = match &payload.payload {
             ExactPaymentPayload::Evm(..) => {
                 return Err(FacilitatorLocalError::UnsupportedNetwork(None));
-            }
+            },
             ExactPaymentPayload::Solana(payload) => payload,
         };
         if payload.network != self.network() {
@@ -406,14 +428,12 @@ impl SolanaProvider {
         let transfer_instruction = if instructions.len() == 3 {
             // verify that the transfer instruction is valid
             // this expects the destination ATA to already exist
-            self.verify_transfer_instruction(&transaction, 2, requirements, false)
-                .await?
+            self.verify_transfer_instruction(&transaction, 2, requirements, false).await?
         } else {
             // verify that the transfer instruction is valid
             // this expects the destination ATA to be created in the same transaction
             self.verify_create_ata_instruction(&transaction, 2, requirements)?;
-            self.verify_transfer_instruction(&transaction, 3, requirements, true)
-                .await?
+            self.verify_transfer_instruction(&transaction, 3, requirements, true).await?
         };
 
         let tx = TransactionInt::new(transaction.clone()).sign(&self.keypair)?;
@@ -454,10 +474,31 @@ impl FromEnvByNetworkBuild for SolanaProvider {
             None => {
                 tracing::warn!(network=%network, "no RPC URL configured, skipping");
                 return Ok(None);
-            }
+            },
         };
         let keypair = from_env::SignerType::from_env()?.make_solana_wallet()?;
-        let provider = SolanaProvider::try_new(keypair, rpc_url, network)?;
+
+        // Load UniversalSettle configuration
+        let mut config = UniversalSettleConfig::from_env()?;
+
+        // Read config from chain to get fee_destination
+        let rpc_client = Arc::new(RpcClient::new(rpc_url.clone()));
+        let (config_pda, _) =
+            Pubkey::find_program_address(&[CONFIG], &config.universalsettle_program_id);
+
+        let account = rpc_client.get_account(&config_pda).await?;
+
+        // Deserialize the account data (skip 8-byte discriminator)
+        if account.data.len() < std::mem::size_of::<UniversalSettleConfigState>() + 8 {
+            return Err("Config account data too short".into());
+        }
+
+        let config_state =
+            bytemuck::try_from_bytes::<UniversalSettleConfigState>(&account.data[8..])
+                .map_err(|_| "Failed to deserialize config".to_string())?;
+        config.fee_destination = config_state.fee_destination;
+
+        let provider = SolanaProvider::try_new(keypair, rpc_url, network, config)?;
         Ok(Some(provider))
     }
 }
@@ -465,6 +506,15 @@ impl FromEnvByNetworkBuild for SolanaProvider {
 pub struct VerifyTransferResult {
     pub payer: SolanaAddress,
     pub transaction: VersionedTransaction,
+}
+
+/// Transfer details extracted from a Partially Signed Transaction
+#[derive(Debug)]
+struct TransferDetails {
+    payer: Pubkey,
+    payee: Pubkey,
+    amount: u64,
+    mint: Option<Pubkey>, // None for SOL, Some(mint) for SPL tokens
 }
 
 #[derive(Debug)]
@@ -489,6 +539,111 @@ impl NetworkProviderOps for SolanaProvider {
     }
 }
 
+impl SolanaProvider {
+    /// Extract transfer details from a Partially Signed Transaction
+    fn extract_transfer_from_pst(
+        &self,
+        pst: &VersionedTransaction,
+        payer: &Pubkey,
+    ) -> Result<TransferDetails, FacilitatorLocalError> {
+        let tx = &pst;
+        let instructions = tx.message.instructions();
+        let static_keys = tx.message.static_account_keys();
+
+        // Find the transfer instruction
+        for instruction in instructions {
+            let program_id = instruction.program_id(static_keys);
+
+            // Check if SPL token transfer
+            if *program_id == spl_token::ID || *program_id == spl_token_2022::ID {
+                let instruction_data = instruction.data.clone();
+
+                // Parse token transfer
+                let token_ix = if *program_id == spl_token::ID {
+                    spl_token::instruction::TokenInstruction::unpack(&instruction_data).map_err(
+                        |e| {
+                            FacilitatorLocalError::DecodingError(format!(
+                                "Failed to unpack SPL token instruction: {}",
+                                e
+                            ))
+                        },
+                    )?
+                } else {
+                    return Err(FacilitatorLocalError::DecodingError(
+                        "SPL Token 2022 not yet supported".to_string(),
+                    ));
+                };
+
+                // Extract amount and accounts
+                if let spl_token::instruction::TokenInstruction::TransferChecked {
+                    amount,
+                    decimals: _,
+                } = token_ix
+                {
+                    // Account indices in TransferChecked:
+                    // 0: source, 1: mint, 2: destination, 3: authority
+                    let accounts = &instruction.accounts;
+
+                    if accounts.len() < 4 {
+                        return Err(FacilitatorLocalError::DecodingError(
+                            "Invalid instruction account count".to_string(),
+                        ));
+                    }
+
+                    let source_idx = accounts[0];
+                    let mint_idx = accounts[1];
+                    let dest_idx = accounts[2];
+
+                    if source_idx as usize >= static_keys.len()
+                        || mint_idx as usize >= static_keys.len()
+                        || dest_idx as usize >= static_keys.len()
+                    {
+                        return Err(FacilitatorLocalError::DecodingError(
+                            "Invalid account index".to_string(),
+                        ));
+                    }
+
+                    let mint = static_keys[mint_idx as usize];
+                    let payee = static_keys[dest_idx as usize];
+
+                    return Ok(TransferDetails { payer: *payer, payee, amount, mint: Some(mint) });
+                }
+            }
+
+            // Check if SOL transfer
+            if *program_id == solana_sdk::system_program::ID {
+                let instruction_data = instruction.data.clone();
+                // SOL transfer opcode is 2
+                if !instruction_data.is_empty() && instruction_data[0] == 2 {
+                    // Amount is in bytes 4-12 (u64)
+                    let amount = u64::from_le_bytes(instruction.data[4..12].try_into().unwrap());
+
+                    let accounts = &instruction.accounts;
+                    if accounts.len() >= 2 {
+                        let from_idx = accounts[0];
+                        let to_idx = accounts[1];
+
+                        if (from_idx as usize) < static_keys.len()
+                            && (to_idx as usize) < static_keys.len()
+                        {
+                            return Ok(TransferDetails {
+                                payer: *payer,
+                                payee: static_keys[to_idx as usize],
+                                amount,
+                                mint: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(FacilitatorLocalError::DecodingError(
+            "Could not extract transfer details from PST".to_string(),
+        ))
+    }
+}
+
 impl Facilitator for SolanaProvider {
     type Error = FacilitatorLocalError;
 
@@ -498,30 +653,72 @@ impl Facilitator for SolanaProvider {
     }
 
     async fn settle(&self, request: &SettleRequest) -> Result<SettleResponse, Self::Error> {
+        // Step 1: Verify PST (keep existing logic)
         let verification = self.verify_transfer(request).await?;
-        let tx = TransactionInt::new(verification.transaction).sign(&self.keypair)?;
-        // Verify if fully signed
-        if !tx.is_fully_signed() {
-            tracing::event!(Level::WARN, status = "failed", "undersigned transaction");
-            return Ok(SettleResponse {
-                success: false,
-                error_reason: Some(FacilitatorErrorReason::UnexpectedSettleError),
-                payer: verification.payer.into(),
-                transaction: None,
-                network: self.network(),
-            });
-        }
-        let tx_sig = tx
-            .send_and_confirm(&self.rpc_client, CommitmentConfig::confirmed())
-            .await?;
-        let settle_response = SettleResponse {
+
+        // Step 2: Extract transfer details from verified PST
+        let payer_pubkey = verification.payer.pubkey;
+        let transfer = self.extract_transfer_from_pst(&verification.transaction, &payer_pubkey)?;
+
+        // Step 3: Get fee destination from config (already read from chain on initialization)
+        let fee_destination = self.config.fee_destination;
+
+        // Step 4: Derive ATAs if needed and determine source/dest accounts
+        let (payer_source, resource_owner_dest, fee_dest_acc, is_sol) =
+            if let Some(mint) = transfer.mint {
+                // SPL token - need to derive ATAs
+                let payer_source = get_associated_token_address(&transfer.payer, &mint);
+
+                let resource_owner_dest = get_associated_token_address(&transfer.payee, &mint);
+
+                let fee_dest_acc = get_associated_token_address(&fee_destination, &mint);
+
+                (payer_source, resource_owner_dest, fee_dest_acc, false)
+            } else {
+                // SOL - use wallets directly
+                (transfer.payer, transfer.payee, fee_destination, true)
+            };
+
+        // Step 5: Build UniversalSettle instruction
+        use universalsettle_api::sdk;
+
+        let settle_ix = sdk::settle(
+            transfer.payer,
+            transfer.payee,
+            payer_source,
+            resource_owner_dest,
+            fee_dest_acc,
+            transfer.mint.unwrap_or(solana_sdk::pubkey::Pubkey::default()),
+            transfer.amount,
+            is_sol,
+        );
+
+        // Step 6: Build transaction
+        let latest_blockhash = self.rpc_client.get_latest_blockhash().await.map_err(|e| {
+            FacilitatorLocalError::DecodingError(format!("Failed to get latest blockhash: {}", e))
+        })?;
+
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[settle_ix],
+            Some(&self.keypair.pubkey()),
+        );
+
+        // Note: set_recent_blockhash is not needed with new_with_payer
+        tx.sign(&[&*self.keypair], latest_blockhash);
+
+        // Step 7: Send and confirm
+        let signature = self.rpc_client.send_and_confirm_transaction(&tx).await.map_err(|e| {
+            FacilitatorLocalError::DecodingError(format!("Transaction failed: {}", e))
+        })?;
+
+        // Step 8: Return settlement response
+        Ok(SettleResponse {
             success: true,
             error_reason: None,
             payer: verification.payer.into(),
-            transaction: Some(TransactionHash::Solana(*tx_sig.as_array())),
+            transaction: Some(TransactionHash::Solana(*signature.as_array())),
             network: self.network(),
-        };
-        Ok(settle_response)
+        })
     }
 
     async fn supported(&self) -> Result<SupportedPaymentKindsResponse, Self::Error> {
@@ -529,9 +726,7 @@ impl Facilitator for SolanaProvider {
             network: self.network().to_string(),
             scheme: Scheme::Exact,
             x402_version: X402Version::V1,
-            extra: Some(SupportedPaymentKindExtra {
-                fee_payer: self.signer_address(),
-            }),
+            extra: Some(SupportedPaymentKindExtra { fee_payer: self.signer_address() }),
         }];
         Ok(SupportedPaymentKindsResponse { kinds })
     }
@@ -578,13 +773,11 @@ impl InstructionInt {
                 "invalid_exact_svm_payload_transaction_instructions".to_string(),
             ),
         )?;
-        let pubkey = self
-            .account_keys
-            .get(account_index as usize)
-            .cloned()
-            .ok_or(FacilitatorLocalError::DecodingError(
+        let pubkey = self.account_keys.get(account_index as usize).cloned().ok_or(
+            FacilitatorLocalError::DecodingError(
                 "invalid_exact_svm_payload_transaction_instructions".to_string(),
-            ))?;
+            ),
+        )?;
         Ok(pubkey)
     }
 }
@@ -598,21 +791,14 @@ impl TransactionInt {
         Self { inner: transaction }
     }
     pub fn instruction(&self, index: usize) -> Result<InstructionInt, FacilitatorLocalError> {
-        let instruction = self
-            .inner
-            .message
-            .instructions()
-            .get(index)
-            .cloned()
-            .ok_or(FacilitatorLocalError::DecodingError(
+        let instruction = self.inner.message.instructions().get(index).cloned().ok_or(
+            FacilitatorLocalError::DecodingError(
                 "invalid_exact_svm_payload_transaction_instructions".to_string(),
-            ))?;
+            ),
+        )?;
         let account_keys = self.inner.message.static_account_keys().to_vec();
 
-        Ok(InstructionInt {
-            instruction,
-            account_keys,
-        })
+        Ok(InstructionInt { instruction, account_keys })
     }
 
     pub fn is_fully_signed(&self) -> bool {
@@ -639,12 +825,11 @@ impl TransactionInt {
         let num_required = tx.message.header().num_required_signatures as usize;
         let static_keys = tx.message.static_account_keys();
         // Find signer’s position
-        let pos = static_keys[..num_required]
-            .iter()
-            .position(|k| *k == keypair.pubkey())
-            .ok_or(FacilitatorLocalError::DecodingError(
+        let pos = static_keys[..num_required].iter().position(|k| *k == keypair.pubkey()).ok_or(
+            FacilitatorLocalError::DecodingError(
                 "invalid_exact_svm_payload_transaction_simulation_failed".to_string(),
-            ))?;
+            ),
+        )?;
         // Ensure signature vector is large enough, then place the signature
         if tx.signatures.len() < num_required {
             tx.signatures.resize(num_required, Signature::default());

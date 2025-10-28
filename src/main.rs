@@ -33,6 +33,7 @@ use crate::sig_down::SigDown;
 use crate::telemetry::Telemetry;
 
 mod chain;
+mod config;
 mod facilitator;
 mod facilitator_local;
 mod from_env;
